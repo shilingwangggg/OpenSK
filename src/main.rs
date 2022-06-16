@@ -134,20 +134,22 @@ fn main() {
             let reply = ctap.process_hid_packet(&pkt_request, transport, now);
             // This block handles sending packets.
             for mut pkt_reply in reply {
-                let hid_connection = transport.hid_connection(ctap.env());
-                match hid_connection.send_or_recv_with_timeout(&mut pkt_reply, SEND_TIMEOUT) {
-                    Ok(SendOrRecvStatus::Timeout) => {
+                let status =
+                    usb_ctap_hid::send_or_recv_with_timeout(&mut pkt_reply, SEND_TIMEOUT, endpoint)
+                        .flex_unwrap();
+                match status {
+                    usb_ctap_hid::SendOrRecvStatus::Timeout => {
                         #[cfg(feature = "debug_ctap")]
                         print_packet_notice("Sending packet timed out", &clock);
                         // TODO: reset the ctap_hid state.
                         // Since sending the packet timed out, we cancel this reply.
                         break;
                     }
-                    Ok(SendOrRecvStatus::Sent) => {
+                    usb_ctap_hid::SendOrRecvStatus::Sent => {
                         #[cfg(feature = "debug_ctap")]
                         print_packet_notice("Sent packet", &clock);
                     }
-                    Ok(SendOrRecvStatus::Received) => {
+                    usb_ctap_hid::SendOrRecvStatus::Received(_) => {
                         #[cfg(feature = "debug_ctap")]
                         print_packet_notice("Received an UNEXPECTED packet", &clock);
                         // TODO: handle this unexpected packet.

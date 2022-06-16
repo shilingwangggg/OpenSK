@@ -273,17 +273,63 @@ impl Env for TockEnv {
     }
 }
 
-    fn customization(&self) -> &Self::Customization {
-        &DEFAULT_CUSTOMIZATION
-    }
-
-    fn main_hid_connection(&mut self) -> &mut Self::HidConnection {
-        &mut self.main_connection
-    }
-
-    #[cfg(feature = "vendor_hid")]
-    fn vendor_hid_connection(&mut self) -> &mut Self::HidConnection {
-        &mut self.vendor_connection
+// Returns whether the keepalive was sent, or false if cancelled.
+fn send_keepalive_up_needed(
+    env: &mut TockEnv,
+    channel: Channel,
+    timeout: Duration<isize>,
+) -> Result<(), Ctap2StatusCode> {
+    let (endpoint, cid) = match channel {
+        Channel::MainHid(cid) => (usb_ctap_hid::UsbEndpoint::MainHid, cid),
+        #[cfg(feature = "vendor_hid")]
+        Channel::VendorHid(cid) => (usb_ctap_hid::UsbEndpoint::VendorHid, cid),
+    };
+    let keepalive_msg = CtapHid::keepalive(cid, KeepaliveStatus::UpNeeded);
+    for mut pkt in keepalive_msg {
+        let status =
+            usb_ctap_hid::send_or_recv_with_timeout(&mut pkt, timeout, endpoint).flex_unwrap();
+        match status {
+            usb_ctap_hid::SendOrRecvStatus::Timeout => {
+                debug_ctap!(env, "Sending a KEEPALIVE packet timed out");
+                // TODO: abort user presence test?
+            }
+            usb_ctap_hid::SendOrRecvStatus::Sent => {
+                debug_ctap!(env, "Sent KEEPALIVE packet");
+            }
+            usb_ctap_hid::SendOrRecvStatus::Received(received_endpoint) => {
+                // We only parse one packet, because we only care about CANCEL.
+                let (received_cid, processed_packet) = CtapHid::process_single_packet(&pkt);
+                if received_endpoint != endpoint || received_cid != &cid {
+                    debug_ctap!(
+                        env,
+                        "Received a packet on channel ID {:?} while sending a KEEPALIVE packet",
+                        received_cid,
+                    );
+                    return Ok(());
+                }
+                match processed_packet {
+                    ProcessedPacket::InitPacket { cmd, .. } => {
+                        if cmd == CtapHidCommand::Cancel as u8 {
+                            // We ignore the payload, we can't answer with an error code anyway.
+                            debug_ctap!(env, "User presence check cancelled");
+                            return Err(Ctap2StatusCode::CTAP2_ERR_KEEPALIVE_CANCEL);
+                        } else {
+                            debug_ctap!(
+                                env,
+                                "Discarded packet with command {} received while sending a KEEPALIVE packet",
+                                cmd,
+                            );
+                        }
+                    }
+                    ProcessedPacket::ContinuationPacket { .. } => {
+                        debug_ctap!(
+                            env,
+                            "Discarded continuation packet received while sending a KEEPALIVE packet",
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
