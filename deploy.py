@@ -770,7 +770,8 @@ class OpenSKInstaller:
       info("Nothing to do.")
       return 0
 
-    subprocess.run(["./maintainers/patches", "check"], check=False)
+    if self.args.check_patches:
+      subprocess.run(["./maintainers/patches", "check"], check=False)
 
     # Compile what needs to be compiled
     board_props = SUPPORTED_BOARDS[self.args.board]
