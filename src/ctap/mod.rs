@@ -78,6 +78,7 @@ use alloc::vec::Vec;
 use arrayref::array_ref;
 use byteorder::{BigEndian, ByteOrder};
 use core::convert::TryFrom;
+use core::marker::PhantomData;
 use crypto::hmac::hmac_256;
 use crypto::sha256::Sha256;
 use crypto::{ecdsa, Hash256};
@@ -260,8 +261,8 @@ fn verify_signature(
 
 // Sends keepalive packet during user presence checking. If user agent replies with CANCEL response,
 // returns Err(UserPresenceError::Canceled).
-fn send_keepalive_up_needed(
-    env: &mut impl Env,
+fn send_keepalive_up_needed<E: Env>(
+    env: &mut E,
     channel: Channel,
     timeout: Milliseconds<ClockInt>,
 ) -> Result<(), UserPresenceError> {
@@ -270,7 +271,7 @@ fn send_keepalive_up_needed(
         #[cfg(feature = "vendor_hid")]
         Channel::VendorHid(cid) => (cid, Transport::VendorHid),
     };
-    let keepalive_msg = CtapHid::keepalive(cid, KeepaliveStatus::UpNeeded);
+    let keepalive_msg = CtapHid::<E>::keepalive(cid, KeepaliveStatus::UpNeeded);
     for mut pkt in keepalive_msg {
         let ctap_hid_connection = transport.hid_connection(env);
         match ctap_hid_connection.send_or_recv_with_timeout(&mut pkt, timeout) {
@@ -284,7 +285,7 @@ fn send_keepalive_up_needed(
             }
             Ok(SendOrRecvStatus::Received) => {
                 // We only parse one packet, because we only care about CANCEL.
-                let (received_cid, processed_packet) = CtapHid::process_single_packet(&pkt);
+                let (received_cid, processed_packet) = CtapHid::<E>::process_single_packet(&pkt);
                 if received_cid != &cid {
                     debug_ctap!(
                         env,
@@ -323,7 +324,7 @@ fn send_keepalive_up_needed(
 /// Blocks for user presence.
 ///
 /// Returns an error in case of timeout, user declining presence request, or keepalive error.
-fn check_user_presence(env: &mut impl Env, channel: Channel) -> Result<(), Ctap2StatusCode> {
+fn check_user_presence<E: Env>(env: &mut E, channel: Channel) -> Result<(), Ctap2StatusCode> {
     env.user_presence().check_init();
 
     // The timeout is N times the keepalive delay.
@@ -394,20 +395,22 @@ pub enum StatefulCommand {
 ///
 /// Additionally, state that is held over multiple commands is assigned to a channel. We discard
 /// all state when we receive data on a different channel.
-pub struct StatefulPermission {
-    timer: Option<LibtockAlarmTimer>,
+pub struct StatefulPermission<E: Env> {
+    _phantom: PhantomData<E>,
+    permission: TimedPermission,
     command_type: Option<StatefulCommand>,
     channel: Option<Channel>,
 }
 
-impl StatefulPermission {
+impl<E: Env> StatefulPermission<E> {
     /// Creates the command state at device startup.
     ///
     /// Resets are only possible after a power cycle. Therefore, initialization
     /// means allowing Reset, and Reset cannot be granted later.
-    pub fn new_reset() -> StatefulPermission {
+    pub fn new_reset(now: CtapInstant) -> StatefulPermission<E> {
         StatefulPermission {
-            timer: Timer::start(10000),
+            _phantom: PhantomData,
+            permission: TimedPermission::granted(now, RESET_TIMEOUT_DURATION),
             command_type: Some(StatefulCommand::Reset),
             channel: None,
         }
@@ -515,24 +518,24 @@ impl StatefulPermission {
 
 // This struct currently holds all state, not only the persistent memory. The persistent members are
 // in the persistent store field.
-pub struct CtapState {
-    client_pin: ClientPin,
+pub struct CtapState<E: Env> {
+    client_pin: ClientPin<E>,
     #[cfg(feature = "with_ctap1")]
     pub(crate) u2f_up_state: U2fUserPresenceState,
     // The state initializes to Reset and its timeout, and never goes back to Reset.
-    stateful_command_permission: StatefulPermission,
+    stateful_command_permission: StatefulPermission<E>,
     large_blobs: LargeBlobs,
 }
 
-impl CtapState {
-    pub fn new(env: &mut impl Env) -> Self {
+impl<E: Env> CtapState<E> {
+    pub fn new(env: &mut E, now: CtapInstant) -> Self {
         storage::init(env).ok().unwrap();
-        let client_pin = ClientPin::new(env.rng());
+        let client_pin = ClientPin::<E>::new(env);
         CtapState {
             client_pin,
             #[cfg(feature = "with_ctap1")]
             u2f_up_state: U2fUserPresenceState::new(U2F_UP_PROMPT_TIMEOUT, TOUCH_TIMEOUT),
-            stateful_command_permission: StatefulPermission::new_reset(),
+            stateful_command_permission: StatefulPermission::<E>::new_reset(now),
             large_blobs: LargeBlobs::new(),
         }
     }
@@ -544,7 +547,7 @@ impl CtapState {
 
     pub fn increment_global_signature_counter(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
     ) -> Result<(), Ctap2StatusCode> {
         if env.customization().use_signature_counter() {
             let increment = env.rng().gen_uniform_u32x8()[0] % 8 + 1;
@@ -557,13 +560,13 @@ impl CtapState {
     // If alwaysUv is enabled and the authenticator does not support internal UV,
     // CTAP1 needs to be disabled.
     #[cfg(feature = "with_ctap1")]
-    pub fn allows_ctap1(&self, env: &mut impl Env) -> Result<bool, Ctap2StatusCode> {
+    pub fn allows_ctap1(&self, env: &mut E) -> Result<bool, Ctap2StatusCode> {
         Ok(!storage::has_always_uv(env)?)
     }
 
     pub fn process_command(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
         command_cbor: &[u8],
         channel: Channel,
     ) -> Vec<u8> {
@@ -592,7 +595,7 @@ impl CtapState {
     /// It should make command parsing easier to test.
     pub fn process_parsed_command(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
         command: Command,
         channel: Channel,
     ) -> Result<ResponseData, Ctap2StatusCode> {
@@ -635,7 +638,7 @@ impl CtapState {
 
     fn process_fido_command(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
         command: Command,
         channel: Channel,
     ) -> Result<ResponseData, Ctap2StatusCode> {
@@ -676,7 +679,7 @@ impl CtapState {
 
     fn process_vendor_command(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
         command: Command,
         channel: Channel,
     ) -> Result<ResponseData, Ctap2StatusCode> {
@@ -692,7 +695,7 @@ impl CtapState {
 
     fn pin_uv_auth_precheck(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
         pin_uv_auth_param: &Option<Vec<u8>>,
         pin_uv_auth_protocol: Option<PinUvAuthProtocol>,
         channel: Channel,
@@ -714,7 +717,7 @@ impl CtapState {
 
     fn process_make_credential(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
         make_credential_params: AuthenticatorMakeCredentialParameters,
         channel: Channel,
     ) -> Result<ResponseData, Ctap2StatusCode> {
@@ -964,7 +967,7 @@ impl CtapState {
     // The computation is deterministic, and private_key expected to be unique.
     fn generate_cred_random(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
         private_key: &PrivateKey,
         has_uv: bool,
     ) -> Result<[u8; 32], Ctap2StatusCode> {
@@ -977,7 +980,7 @@ impl CtapState {
     // and returns the correct Get(Next)Assertion response.
     fn assertion_response(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
         mut credential: PublicKeyCredentialSource,
         assertion_input: AssertionInput,
         number_of_credentials: Option<usize>,
@@ -995,11 +998,10 @@ impl CtapState {
             let encrypted_output = if let Some(hmac_secret_input) = extensions.hmac_secret {
                 let cred_random =
                     self.generate_cred_random(env, &credential.private_key, has_uv)?;
-                Some(self.client_pin.process_hmac_secret(
-                    env.rng(),
-                    hmac_secret_input,
-                    &cred_random,
-                )?)
+                Some(
+                    self.client_pin
+                        .process_hmac_secret(env, hmac_secret_input, &cred_random)?,
+                )
             } else {
                 None
             };
@@ -1066,7 +1068,7 @@ impl CtapState {
     // Returns the first applicable credential from the allow list.
     fn get_any_credential_from_allow_list(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
         allow_list: Vec<PublicKeyCredentialDescriptor>,
         rp_id: &str,
         rp_id_hash: &[u8],
@@ -1089,7 +1091,7 @@ impl CtapState {
 
     fn process_get_assertion(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
         get_assertion_params: AuthenticatorGetAssertionParameters,
         channel: Channel,
         now: CtapInstant,
@@ -1225,10 +1227,7 @@ impl CtapState {
         )
     }
 
-    fn process_get_next_assertion(
-        &mut self,
-        env: &mut impl Env,
-    ) -> Result<ResponseData, Ctap2StatusCode> {
+    fn process_get_next_assertion(&mut self, env: &mut E) -> Result<ResponseData, Ctap2StatusCode> {
         let (assertion_input, credential_key) = self
             .stateful_command_permission
             .next_assertion_credential()?;
@@ -1236,7 +1235,7 @@ impl CtapState {
         self.assertion_response(env, credential, assertion_input, None, true)
     }
 
-    fn process_get_info(&self, env: &mut impl Env) -> Result<ResponseData, Ctap2StatusCode> {
+    fn process_get_info(&self, env: &mut E) -> Result<ResponseData, Ctap2StatusCode> {
         let has_always_uv = storage::has_always_uv(env)?;
         #[cfg_attr(not(feature = "with_ctap1"), allow(unused_mut))]
         let mut versions = vec![
@@ -1309,7 +1308,7 @@ impl CtapState {
 
     fn process_reset(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
         channel: Channel,
     ) -> Result<ResponseData, Ctap2StatusCode> {
         match self.stateful_command_permission.get_command()? {
@@ -1319,7 +1318,7 @@ impl CtapState {
         check_user_presence(env, channel)?;
 
         storage::reset(env)?;
-        self.client_pin.reset(env.rng());
+        self.client_pin.reset(env);
         #[cfg(feature = "with_ctap1")]
         {
             // We create a block statement to wrap this assignment expression, because attributes
@@ -1331,7 +1330,7 @@ impl CtapState {
 
     fn process_selection(
         &self,
-        env: &mut impl Env,
+        env: &mut E,
         channel: Channel,
     ) -> Result<ResponseData, Ctap2StatusCode> {
         check_user_presence(env, channel)?;
@@ -1340,7 +1339,7 @@ impl CtapState {
 
     fn process_vendor_configure(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
         params: AuthenticatorVendorConfigureParameters,
         channel: Channel,
     ) -> Result<ResponseData, Ctap2StatusCode> {
@@ -1394,7 +1393,7 @@ impl CtapState {
 
     fn process_vendor_upgrade(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
         params: AuthenticatorVendorUpgradeParameters,
     ) -> Result<ResponseData, Ctap2StatusCode> {
         let AuthenticatorVendorUpgradeParameters {
@@ -1433,10 +1432,7 @@ impl CtapState {
         Ok(ResponseData::AuthenticatorVendorUpgrade)
     }
 
-    fn process_vendor_upgrade_info(
-        &self,
-        env: &mut impl Env,
-    ) -> Result<ResponseData, Ctap2StatusCode> {
+    fn process_vendor_upgrade_info(&self, env: &mut E) -> Result<ResponseData, Ctap2StatusCode> {
         let upgrade_locations = env
             .upgrade_storage()
             .ok_or(Ctap2StatusCode::CTAP1_ERR_INVALID_COMMAND)?;
@@ -1449,7 +1445,7 @@ impl CtapState {
 
     pub fn generate_auth_data(
         &self,
-        env: &mut impl Env,
+        env: &mut E,
         rp_id_hash: &[u8],
         flag_byte: u8,
     ) -> Result<Vec<u8>, Ctap2StatusCode> {
@@ -1551,7 +1547,7 @@ mod test {
     #[test]
     fn test_get_info() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
         let info_reponse =
             ctap_state.process_command(&mut env, &[0x04], DUMMY_CHANNEL, CtapInstant::new(0));
 
@@ -1663,7 +1659,7 @@ mod test {
     #[test]
     fn test_resident_process_make_credential() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let make_credential_params = create_minimal_make_credential_parameters();
         let make_credential_response =
@@ -1681,7 +1677,7 @@ mod test {
     #[test]
     fn test_non_resident_process_make_credential() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let mut make_credential_params = create_minimal_make_credential_parameters();
         make_credential_params.options.rk = false;
@@ -1700,7 +1696,7 @@ mod test {
     #[test]
     fn test_process_make_credential_unsupported_algorithm() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let mut make_credential_params = create_minimal_make_credential_parameters();
         make_credential_params.pub_key_cred_params = vec![];
@@ -1716,8 +1712,8 @@ mod test {
     #[test]
     fn test_process_make_credential_credential_excluded() {
         let mut env = TestEnv::new();
-        let excluded_private_key = PrivateKey::new_ecdsa(&mut env);
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let excluded_private_key = crypto::ecdsa::SecKey::gensk(env.rng());
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let excluded_credential_id = vec![0x01, 0x23, 0x45, 0x67];
         let make_credential_params =
@@ -1749,7 +1745,7 @@ mod test {
     #[test]
     fn test_process_make_credential_credential_with_cred_protect() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let test_policy = CredentialProtectionPolicy::UserVerificationOptionalWithCredentialIdList;
         let make_credential_params =
@@ -1800,7 +1796,7 @@ mod test {
     #[test]
     fn test_process_make_credential_hmac_secret() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let extensions = MakeCredentialExtensions {
             hmac_secret: true,
@@ -1827,7 +1823,7 @@ mod test {
     #[test]
     fn test_process_make_credential_hmac_secret_resident_key() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let extensions = MakeCredentialExtensions {
             hmac_secret: true,
@@ -1853,7 +1849,7 @@ mod test {
     #[test]
     fn test_process_make_credential_min_pin_length() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         // First part: The extension is ignored, since the RP ID is not on the list.
         let extensions = MakeCredentialExtensions {
@@ -1902,7 +1898,7 @@ mod test {
     #[test]
     fn test_process_make_credential_cred_blob_ok() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let extensions = MakeCredentialExtensions {
             cred_blob: Some(vec![0xCB]),
@@ -1934,7 +1930,7 @@ mod test {
     #[test]
     fn test_process_make_credential_cred_blob_too_big() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let extensions = MakeCredentialExtensions {
             cred_blob: Some(vec![0xCB; env.customization().max_cred_blob_length() + 1]),
@@ -1966,7 +1962,7 @@ mod test {
     #[test]
     fn test_process_make_credential_large_blob_key() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let extensions = MakeCredentialExtensions {
             large_blob_key: Some(true),
@@ -1998,10 +1994,14 @@ mod test {
         let mut env = TestEnv::new();
         let key_agreement_key = crypto::ecdh::SecKey::gensk(env.rng());
         let pin_uv_auth_token = [0x91; PIN_TOKEN_LENGTH];
-        let client_pin =
-            ClientPin::new_test(key_agreement_key, pin_uv_auth_token, pin_uv_auth_protocol);
+        let client_pin = ClientPin::<TestEnv>::new_test(
+            &mut env,
+            key_agreement_key,
+            pin_uv_auth_token,
+            pin_uv_auth_protocol,
+        );
 
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
         ctap_state.client_pin = client_pin;
         storage::set_pin(&mut env, &[0x88; 16], 4).unwrap();
 
@@ -2050,7 +2050,7 @@ mod test {
     #[test]
     fn test_non_resident_process_make_credential_with_pin() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
         storage::set_pin(&mut env, &[0x88; 16], 4).unwrap();
 
         let mut make_credential_params = create_minimal_make_credential_parameters();
@@ -2070,7 +2070,7 @@ mod test {
     #[test]
     fn test_resident_process_make_credential_with_pin() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
         storage::set_pin(&mut env, &[0x88; 16], 4).unwrap();
 
         let make_credential_params = create_minimal_make_credential_parameters();
@@ -2085,7 +2085,7 @@ mod test {
     #[test]
     fn test_process_make_credential_with_pin_always_uv() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         storage::toggle_always_uv(&mut env).unwrap();
         let make_credential_params = create_minimal_make_credential_parameters();
@@ -2126,7 +2126,7 @@ mod test {
             Some(vec!["example.com".to_string()]),
         );
 
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
         test_helpers::enable_enterprise_attestation(&mut ctap_state, &mut env).unwrap();
 
         let mut make_credential_params = create_minimal_make_credential_parameters();
@@ -2173,7 +2173,7 @@ mod test {
         );
         assert!(customization::is_valid(env.customization()));
 
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
         test_helpers::enable_enterprise_attestation(&mut ctap_state, &mut env).unwrap();
 
         let mut make_credential_params = create_minimal_make_credential_parameters();
@@ -2206,7 +2206,7 @@ mod test {
         env.customization_mut()
             .setup_enterprise_attestation(Some(EnterpriseAttestationMode::PlatformManaged), None);
 
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let mut make_credential_params = create_minimal_make_credential_parameters();
         make_credential_params.enterprise_attestation = Some(2);
@@ -2233,7 +2233,7 @@ mod test {
     fn test_process_make_credential_cancelled() {
         let mut env = TestEnv::new();
         env.user_presence().set(|| Err(UserPresenceError::Canceled));
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let make_credential_params = create_minimal_make_credential_parameters();
         let make_credential_response =
@@ -2328,7 +2328,7 @@ mod test {
     #[test]
     fn test_resident_process_get_assertion() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let make_credential_params = create_minimal_make_credential_parameters();
         assert!(ctap_state
@@ -2413,7 +2413,7 @@ mod test {
     fn test_helper_process_get_assertion_hmac_secret(pin_uv_auth_protocol: PinUvAuthProtocol) {
         let mut env = TestEnv::new();
         let key_agreement_key = crypto::ecdh::SecKey::gensk(env.rng());
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let make_extensions = MakeCredentialExtensions {
             hmac_secret: true,
@@ -2480,7 +2480,7 @@ mod test {
     ) {
         let mut env = TestEnv::new();
         let key_agreement_key = crypto::ecdh::SecKey::gensk(env.rng());
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let make_extensions = MakeCredentialExtensions {
             hmac_secret: true,
@@ -2536,7 +2536,7 @@ mod test {
         let mut env = TestEnv::new();
         let private_key = PrivateKey::new_ecdsa(&mut env);
         let credential_id = env.rng().gen_uniform_u8x32().to_vec();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let cred_desc = PublicKeyCredentialDescriptor {
             key_type: PublicKeyCredentialType::PublicKey,
@@ -2650,7 +2650,7 @@ mod test {
         let mut env = TestEnv::new();
         let private_key = PrivateKey::new_ecdsa(&mut env);
         let credential_id = env.rng().gen_uniform_u8x32().to_vec();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let credential = PublicKeyCredentialSource {
             key_type: PublicKeyCredentialType::PublicKey,
@@ -2708,7 +2708,7 @@ mod test {
         let mut env = TestEnv::new();
         let private_key = PrivateKey::new_ecdsa(&mut env);
         let credential_id = env.rng().gen_uniform_u8x32().to_vec();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let credential = PublicKeyCredentialSource {
             key_type: PublicKeyCredentialType::PublicKey,
@@ -2763,10 +2763,14 @@ mod test {
         let mut env = TestEnv::new();
         let key_agreement_key = crypto::ecdh::SecKey::gensk(env.rng());
         let pin_uv_auth_token = [0x88; 32];
-        let client_pin =
-            ClientPin::new_test(key_agreement_key, pin_uv_auth_token, pin_uv_auth_protocol);
+        let client_pin = ClientPin::<TestEnv>::new_test(
+            &mut env,
+            key_agreement_key,
+            pin_uv_auth_token,
+            pin_uv_auth_protocol,
+        );
 
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let mut make_credential_params = create_minimal_make_credential_parameters();
         let user1 = PublicKeyCredentialUserEntity {
@@ -2859,7 +2863,7 @@ mod test {
     #[test]
     fn test_process_get_next_assertion_three_credentials_no_uv() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let mut make_credential_params = create_minimal_make_credential_parameters();
         make_credential_params.user.user_id = vec![0x01];
@@ -2928,7 +2932,7 @@ mod test {
     #[test]
     fn test_process_get_next_assertion_not_allowed() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let get_assertion_response = ctap_state.process_get_next_assertion(&mut env);
         assert_eq!(
@@ -2992,8 +2996,8 @@ mod test {
     #[test]
     fn test_process_reset() {
         let mut env = TestEnv::new();
-        let private_key = PrivateKey::new_ecdsa(&mut env);
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let private_key = crypto::ecdsa::SecKey::gensk(env.rng());
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let credential_id = vec![0x01, 0x23, 0x45, 0x67];
         let credential_source = PublicKeyCredentialSource {
@@ -3024,7 +3028,7 @@ mod test {
     fn test_process_reset_cancelled() {
         let mut env = TestEnv::new();
         env.user_presence().set(|| Err(UserPresenceError::Canceled));
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let reset_reponse = ctap_state.process_reset(&mut env, DUMMY_CHANNEL);
 
@@ -3037,7 +3041,7 @@ mod test {
     #[test]
     fn test_process_reset_not_first() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         // This is a GetNextAssertion command.
         ctap_state.process_command(&mut env, &[0x08], DUMMY_CHANNEL, CtapInstant::new(0));
@@ -3049,7 +3053,7 @@ mod test {
     #[test]
     fn test_process_credential_management_unknown_subcommand() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         // The subcommand 0xEE does not exist.
         let reponse = ctap_state.process_command(
@@ -3065,7 +3069,7 @@ mod test {
     #[test]
     fn test_process_unknown_command() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         // This command does not exist.
         let reponse =
@@ -3077,7 +3081,7 @@ mod test {
     #[test]
     fn test_signature_counter() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let mut last_counter = storage::global_signature_counter(&mut env).unwrap();
         assert!(last_counter > 0);
@@ -3094,7 +3098,7 @@ mod test {
     #[test]
     fn test_vendor_configure() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         // Nothing should be configured at the beginning
         let response = ctap_state.process_vendor_configure(
@@ -3297,7 +3301,7 @@ mod test {
         // The test identifier matches partition B.
         let mut env = TestEnv::new();
         let private_key = crypto::ecdsa::SecKey::gensk(env.rng());
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
         const METADATA_LEN: usize = 40;
 
         let data = vec![0xFF; 0x1000];
@@ -3388,7 +3392,7 @@ mod test {
     fn test_vendor_upgrade_no_second_partition() {
         let mut env = TestEnv::new();
         env.disable_upgrade_storage();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let data = vec![0xFF; 0x1000];
         let hash = Sha256::hash(&data).to_vec();
@@ -3407,7 +3411,7 @@ mod test {
     #[test]
     fn test_vendor_upgrade_info() {
         let mut env = TestEnv::new();
-        let ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
         let partition_address = env.upgrade_storage().unwrap().partition_address();
 
         let upgrade_info_reponse = ctap_state.process_vendor_upgrade_info(&mut env);
@@ -3424,7 +3428,7 @@ mod test {
     #[test]
     fn test_permission_timeout() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         // Write 2 credentials for later assertions.
         for i in 0..3 {
@@ -3476,7 +3480,7 @@ mod test {
     #[test]
     fn test_reset_timeout() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let response = ctap_state.process_parsed_command(
             &mut env,
@@ -3492,8 +3496,12 @@ mod test {
         let mut env = TestEnv::new();
         let key_agreement_key = crypto::ecdh::SecKey::gensk(env.rng());
         let pin_uv_auth_token = [0x55; 32];
-        let client_pin =
-            ClientPin::new_test(key_agreement_key, pin_uv_auth_token, PinUvAuthProtocol::V1);
+        let client_pin = ClientPin::<TestEnv>::new_test(
+            &mut env,
+            key_agreement_key,
+            pin_uv_auth_token,
+            PinUvAuthProtocol::V1,
+        );
 
         let private_key = PrivateKey::new_ecdsa(&mut env);
         let credential_source = PublicKeyCredentialSource {
@@ -3511,7 +3519,7 @@ mod test {
             large_blob_key: None,
         };
 
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
         ctap_state.client_pin = client_pin;
 
         for i in 0..3 {
@@ -3578,7 +3586,7 @@ mod test {
     #[test]
     fn test_channel_interleaving() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
         const NEW_CHANNEL: Channel = Channel::MainHid([0xAA, 0xAA, 0xAA, 0xAA]);
 
         // Write 3 credentials for later assertions.
@@ -3649,7 +3657,7 @@ mod test {
     #[cfg(feature = "vendor_hid")]
     fn test_main_hid() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let response = ctap_state.process_parsed_command(
             &mut env,
@@ -3674,7 +3682,7 @@ mod test {
     #[cfg(feature = "vendor_hid")]
     fn test_vendor_hid() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env, CtapInstant::new(0));
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
 
         let response = ctap_state.process_parsed_command(
             &mut env,

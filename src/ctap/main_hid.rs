@@ -25,24 +25,25 @@ use crate::timer::{Timer,LibtockAlarmTimer};
 use embedded_time::duration::Milliseconds;
 
 /// Implements the standard CTAP command processing for HID.
-pub struct MainHid {
-    hid: CtapHid,
-    wink_permission: Option<LibtockAlarmTimer>,
+pub struct MainHid<E: Env> {
+    hid: CtapHid<E>,
+    wink_permission: TimedPermission,
 }
 
-impl MainHid {
-    const WINK_TIMEOUT_DURATION: u32 = 5000_u32;
+impl<E: Env> MainHid<E> {
+    const WINK_TIMEOUT_DURATION: Milliseconds<ClockInt> = Milliseconds(5000 as ClockInt);
 
     /// Instantiates a HID handler for CTAP1, CTAP2 and Wink.
     pub fn new() -> Self {
         #[cfg(feature = "with_ctap1")]
-        let capabilities = CtapHid::CAPABILITY_WINK | CtapHid::CAPABILITY_CBOR;
+        let capabilities = CtapHid::<E>::CAPABILITY_WINK | CtapHid::<E>::CAPABILITY_CBOR;
         #[cfg(not(feature = "with_ctap1"))]
-        let capabilities =
-            CtapHid::CAPABILITY_WINK | CtapHid::CAPABILITY_CBOR | CtapHid::CAPABILITY_NMSG;
+        let capabilities = CtapHid::<E>::CAPABILITY_WINK
+            | CtapHid::<E>::CAPABILITY_CBOR
+            | CtapHid::<E>::CAPABILITY_NMSG;
 
-        let hid = CtapHid::new(capabilities);
-        let wink_permission = None;
+        let hid = CtapHid::<E>::new(capabilities);
+        let wink_permission = TimedPermission::waiting();
         MainHid {
             hid,
             wink_permission,
@@ -52,14 +53,15 @@ impl MainHid {
     /// Processes an incoming USB HID packet, and returns an iterator for all outgoing packets.
     pub fn process_hid_packet(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
         packet: &HidPacket,
-        ctap_state: &mut CtapState,
+        now: CtapInstant,
+        ctap_state: &mut CtapState<E>,
     ) -> HidPacketIterator {
         if let Some(message) = self.hid.parse_packet(env, packet) {
             let processed_message = self.process_message(env, message, ctap_state);
             debug_ctap!(env, "Sending message: {:02x?}", processed_message);
-            CtapHid::split_message(processed_message)
+            CtapHid::<E>::split_message(processed_message)
         } else {
             HidPacketIterator::none()
         }
@@ -68,9 +70,10 @@ impl MainHid {
     /// Processes a message's commands that affect the protocol outside HID.
     pub fn process_message(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
         message: Message,
-        ctap_state: &mut CtapState,
+        now: CtapInstant,
+        ctap_state: &mut CtapState<E>,
     ) -> Message {
         // If another command arrives, stop winking to prevent accidential button touches.
         self.wink_permission = None;
@@ -81,12 +84,12 @@ impl MainHid {
             CtapHidCommand::Msg => {
                 // If we don't have CTAP1 backward compatibilty, this command is invalid.
                 #[cfg(not(feature = "with_ctap1"))]
-                return CtapHid::error_message(cid, CtapHidError::InvalidCmd);
+                return CtapHid::<E>::error_message(cid, CtapHidError::InvalidCmd);
 
                 #[cfg(feature = "with_ctap1")]
-                match ctap1::Ctap1Command::process_command(env, &message.payload, ctap_state) {
-                    Ok(payload) => MainHid::ctap1_success_message(cid, &payload),
-                    Err(ctap1_status_code) => MainHid::ctap1_error_message(cid, ctap1_status_code),
+                match ctap1::Ctap1Command::process_command(env, &message.payload, ctap_state, now) {
+                    Ok(payload) => Self::ctap1_success_message(cid, &payload),
+                    Err(ctap1_status_code) => Self::ctap1_error_message(cid, ctap1_status_code),
                 }
             }
             // CTAP 2.1 from 2021-06-15, section 11.2.9.1.2.
@@ -109,7 +112,7 @@ impl MainHid {
                     // The response is empty like the request.
                     message
                 } else {
-                    CtapHid::error_message(cid, CtapHidError::InvalidLen)
+                    CtapHid::<E>::error_message(cid, CtapHidError::InvalidLen)
                 }
             }
             // All other commands have already been processed, keep them as is.
@@ -156,11 +159,11 @@ mod test {
     use crate::ctap::hid::ChannelID;
     use crate::env::test::TestEnv;
 
-    fn new_initialized() -> (MainHid, ChannelID) {
+    fn new_initialized() -> (MainHid<TestEnv>, ChannelID) {
         let (hid, cid) = CtapHid::new_initialized();
         let wink_permission = None;
         (
-            MainHid {
+            MainHid::<TestEnv> {
                 hid,
                 wink_permission,
             },
@@ -171,7 +174,7 @@ mod test {
     #[test]
     fn test_process_hid_packet() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env);
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
         let (mut main_hid, cid) = new_initialized();
 
         let mut ping_packet = [0x00; 64];
@@ -190,7 +193,7 @@ mod test {
     #[test]
     fn test_process_hid_packet_empty() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env);
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
         let (mut main_hid, cid) = new_initialized();
 
         let mut cancel_packet = [0x00; 64];
@@ -208,7 +211,7 @@ mod test {
     #[test]
     fn test_wink() {
         let mut env = TestEnv::new();
-        let mut ctap_state = CtapState::new(&mut env);
+        let mut ctap_state = CtapState::<TestEnv>::new(&mut env, CtapInstant::new(0));
         let (mut main_hid, cid) = new_initialized();
         assert!(!main_hid.should_wink());
 
@@ -223,6 +226,9 @@ mod test {
         );
         assert_eq!(response.next(), Some(wink_packet));
         assert_eq!(response.next(), None);
-        assert!(main_hid.should_wink());
+        assert!(main_hid.should_wink(CtapInstant::new(0)));
+        assert!(
+            !main_hid.should_wink(CtapInstant::new(1) + MainHid::<TestEnv>::WINK_TIMEOUT_DURATION)
+        );
     }
 }
