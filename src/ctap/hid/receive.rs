@@ -28,13 +28,12 @@ use core::mem::swap;
 
 /// A structure to assemble CTAPHID commands from a series of incoming USB HID packets.
 pub struct MessageAssembler<E: Env> {
-    _phantom: PhantomData<E>,
     // Whether this is waiting to receive an initialization packet.
     idle: bool,
     // Current channel ID.
     cid: ChannelID,
     // Timestamp of the last packet received on the current channel.
-    timer: LibtockAlarmTimer,
+    timer: Option<<<E as Env>::Clock as Clock>::Timer>,
     // Current command.
     cmd: u8,
     // Sequence number expected for the next packet.
@@ -48,10 +47,9 @@ pub struct MessageAssembler<E: Env> {
 impl<E: Env> MessageAssembler<E> {
     pub fn new() -> MessageAssembler<E> {
         MessageAssembler {
-            _phantom: PhantomData,
             idle: true,
             cid: [0, 0, 0, 0],
-            last_timestamp: CtapInstant::new(0),
+            timer: None,
             cmd: 0,
             seq: 0,
             remaining_payload_len: 0,
@@ -64,7 +62,7 @@ impl<E: Env> MessageAssembler<E> {
     fn reset(&mut self) {
         self.idle = true;
         self.cid = [0, 0, 0, 0];
-        self.last_timestamp = CtapInstant::new(0);
+        self.timer = None;
         self.cmd = 0;
         self.seq = 0;
         self.remaining_payload_len = 0;
@@ -82,13 +80,12 @@ impl<E: Env> MessageAssembler<E> {
         &mut self,
         env: &mut E,
         packet: &HidPacket,
-        timestamp: CtapInstant,
     ) -> Result<Option<Message>, (ChannelID, CtapHidError)> {
         // TODO: Support non-full-speed devices (i.e. packet len != 64)? This isn't recommended by
         // section 8.8.1
         let (cid, processed_packet) = CtapHid::<E>::process_single_packet(packet);
 
-        if !self.idle && timestamp >= self.last_timestamp + CtapHid::<E>::TIMEOUT_DURATION {
+        if !self.idle && env.clock().check_timer(self.timer).is_none() {
             // The current channel timed out.
             // Save the channel ID and reset the state.
             let current_cid = self.cid;

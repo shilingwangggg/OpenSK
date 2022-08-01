@@ -19,6 +19,7 @@ use crate::api::customization::DEFAULT_CUSTOMIZATION;
 use crate::api::firmware_protection::FirmwareProtection;
 use crate::api::user_presence::{UserPresence, UserPresenceResult};
 use crate::api::{attestation_store, key_store};
+use crate::api::clock::Clock;
 use crate::clock::ClockInt;
 use crate::env::Env;
 use customization::TestCustomization;
@@ -27,6 +28,7 @@ use persistent_store::{BufferOptions, BufferStorage, Store};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rng256::Rng256;
+use core::cell::Cell;
 
 pub mod customization;
 mod upgrade_storage;
@@ -37,6 +39,7 @@ pub struct TestEnv {
     store: Store<BufferStorage>,
     upgrade_storage: Option<BufferUpgradeStorage>,
     customization: TestCustomization,
+    clock: TestClock,
 }
 
 pub struct TestRng256 {
@@ -107,12 +110,14 @@ impl TestEnv {
         let store = Store::new(storage).ok().unwrap();
         let upgrade_storage = Some(BufferUpgradeStorage::new().unwrap());
         let customization = DEFAULT_CUSTOMIZATION.into();
+        let clock = TestClock::new();
         TestEnv {
             rng,
             user_presence,
             store,
             upgrade_storage,
             customization,
+            clock,
         }
     }
 
@@ -154,26 +159,18 @@ struct TestTimer {
     end: u32,
 }
 
-trait Clock {
-    type Timer;
-
-    fn make_timer(&self, duration: u32) -> Self::Timer;
-    
-    fn check_timer(&self, timer: Self::Timer) -> Option<Self::Timer>;
-}
-
 #[derive(Debug)]
 struct TestClock {
-    cur_time: u32,
+    cur_time: Cell<u32>,
 }
 
 impl TestClock {
     fn new() -> Self {
-        TestClock { cur_time: 0 }
+        TestClock { cur_time: Cell::new(0) }
     }
     
-    fn advance(&mut self, duration: u32) {
-        self.cur_time += duration;
+    pub(crate) fn advance(&self, duration: u32) {
+        self.cur_time.set(self.cur_time.get() + duration);
     }
 }
 
@@ -181,11 +178,11 @@ impl Clock for TestClock {
     type Timer = TestTimer;
 
     fn make_timer(&self, duration: u32) -> Self::Timer {
-        TestTimer { end: self.cur_time + duration }
+        TestTimer { end: self.cur_time.get() + duration }
     }
     
     fn check_timer(&self, timer: Self::Timer) -> Option<Self::Timer> {
-        if timer.end > self.cur_time {
+        if timer.end > self.cur_time.get() {
             Some(timer)
         } else {
             None
@@ -268,7 +265,7 @@ impl Env for TestEnv {
         self
     }
 
-    fn clock(&mut self) -> Self::Clock {
-        &mut self.clock    
+    fn clock(&self) -> &Self::Clock {
+        &self.clock
     }
 }

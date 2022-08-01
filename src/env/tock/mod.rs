@@ -14,12 +14,13 @@
 
 pub use self::storage::{TockStorage, TockUpgradeStorage};
 use crate::api::attestation_store::AttestationStore;
+use crate::api::clock::Clock;
 use crate::api::connection::{HidConnection, SendOrRecvError, SendOrRecvResult, SendOrRecvStatus};
 use crate::api::customization::{CustomizationImpl, DEFAULT_CUSTOMIZATION};
 use crate::api::firmware_protection::FirmwareProtection;
 use crate::api::user_presence::{UserPresence, UserPresenceError, UserPresenceResult};
 use crate::api::{attestation_store, key_store};
-use crate::clock::{ClockInt, KEEPALIVE_DELAY_MS};
+use crate::clock::ClockInt;
 use crate::env::Env;
 use core::cell::Cell;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -69,12 +70,11 @@ pub struct TockEnv {
     rng: TockRng256,
     store: Store<TockStorage>,
     upgrade_storage: Option<TockUpgradeStorage>,
-    clock: Clock,
+    clock: TockClock,
     main_connection: TockHidConnection,
     #[cfg(feature = "vendor_hid")]
     vendor_connection: TockHidConnection,
     blink_pattern: usize,
-    clock: Clock,
 }
 
 impl TockEnv {
@@ -268,8 +268,8 @@ impl Env for TockEnv {
         Console::new()
     }
 
-    fn clock(&mut self) -> Self::Clock {
-        &mut self.clock
+    fn clock(&self) -> &Self::Clock {
+        &self.clock
     }
 
     fn main_hid_connection(&mut self) -> &mut Self::HidConnection {
@@ -328,90 +328,6 @@ pub fn wink_leds(pattern_seed: usize) {
 pub fn switch_off_leds() {
     for l in 0..led::count().flex_unwrap() {
         led::get(l).flex_unwrap().off().flex_unwrap();
-    }
-}
-
-const KEEPALIVE_DELAY_MS: isize = 100;
-pub const KEEPALIVE_DELAY_TOCK: Duration<isize> = Duration::from_ms(KEEPALIVE_DELAY_MS);
-
-fn check_user_presence(env: &mut TockEnv, cid: ChannelID) -> Result<(), Ctap2StatusCode> {
-    // The timeout is N times the keepalive delay.
-    const TIMEOUT_ITERATIONS: usize =
-        crate::ctap::TOUCH_TIMEOUT_MS as usize / KEEPALIVE_DELAY_MS as usize;
-
-    // First, send a keep-alive packet to notify that the keep-alive status has changed.
-    send_keepalive_up_needed(env, cid, KEEPALIVE_DELAY_TOCK)?;
-
-    // Listen to the button presses.
-    let button_touched = Cell::new(false);
-    let mut buttons_callback = buttons::with_callback(|_button_num, state| {
-        match state {
-            ButtonState::Pressed => button_touched.set(true),
-            ButtonState::Released => (),
-        };
-    });
-    let mut buttons = buttons_callback.init().flex_unwrap();
-    // At the moment, all buttons are accepted. You can customize your setup here.
-    for mut button in &mut buttons {
-        button.enable().flex_unwrap();
-    }
-
-    let mut keepalive_response = Ok(());
-    for i in 0..TIMEOUT_ITERATIONS {
-        blink_leds(i);
-
-        // Setup a keep-alive callback.
-        let keepalive_expired = Cell::new(false);
-        let mut keepalive_callback = timer::with_callback(|_, _| {
-            keepalive_expired.set(true);
-        });
-        let mut keepalive = keepalive_callback.init().flex_unwrap();
-        let keepalive_alarm = keepalive.set_alarm(KEEPALIVE_DELAY_TOCK).flex_unwrap();
-
-        // Wait for a button touch or an alarm.
-        libtock_drivers::util::yieldk_for(|| button_touched.get() || keepalive_expired.get());
-
-        // Cleanup alarm callback.
-        match keepalive.stop_alarm(keepalive_alarm) {
-            Ok(()) => (),
-            Err(TockError::Command(CommandError {
-                return_code: EALREADY,
-                ..
-            })) => assert!(keepalive_expired.get()),
-            Err(_e) => {
-                #[cfg(feature = "debug_ctap")]
-                panic!("Unexpected error when stopping alarm: {:?}", _e);
-                #[cfg(not(feature = "debug_ctap"))]
-                panic!("Unexpected error when stopping alarm: <error is only visible with the debug_ctap feature>");
-            }
-        }
-
-        // TODO: this may take arbitrary time. The keepalive_delay should be adjusted accordingly,
-        // so that LEDs blink with a consistent pattern.
-        if keepalive_expired.get() {
-            // Do not return immediately, because we must clean up still.
-            keepalive_response = send_keepalive_up_needed(env, cid, KEEPALIVE_DELAY_TOCK);
-        }
-
-        if button_touched.get() || keepalive_response.is_err() {
-            break;
-        }
-    }
-
-    switch_off_leds();
-
-    // Cleanup button callbacks.
-    for mut button in &mut buttons {
-        button.disable().flex_unwrap();
-    }
-
-    // Returns whether the user was present.
-    if keepalive_response.is_err() {
-        keepalive_response
-    } else if button_touched.get() {
-        Ok(())
-    } else {
-        Err(Ctap2StatusCode::CTAP2_ERR_USER_ACTION_TIMEOUT)
     }
 }
 
