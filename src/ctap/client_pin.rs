@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::clock::CtapInstant;
 use super::command::AuthenticatorClientPinParameters;
 use super::data_formats::{
     ok_or_missing, ClientPinSubCommand, CoseKey, GetAssertionHmacSecretInput, PinUvAuthProtocol,
@@ -32,8 +31,9 @@ use crypto::sha256::Sha256;
 use crypto::Hash256;
 #[cfg(test)]
 use enum_iterator::IntoEnumIterator;
-use rng256::Rng256;
 use subtle::ConstantTimeEq;
+#[cfg(test)]
+use crate::env::test::TestEnv;
 
 /// The prefix length of the PIN hash that is stored and compared.
 ///
@@ -105,20 +105,20 @@ pub enum PinPermission {
     AuthenticatorConfiguration = 0x20,
 }
 
-pub struct ClientPin {
+pub struct ClientPin<E: Env> {
     pin_protocol_v1: PinProtocol,
     pin_protocol_v2: PinProtocol,
     consecutive_pin_mismatches: u8,
-    pin_uv_auth_token_state: PinUvAuthTokenState,
+    pin_uv_auth_token_state: PinUvAuthTokenState<E>,
 }
 
-impl ClientPin {
-    pub fn new(rng: &mut impl Rng256) -> ClientPin {
+impl<E: Env> ClientPin<E> {
+    pub fn new(env: &mut E) -> Self {
         ClientPin {
-            pin_protocol_v1: PinProtocol::new(rng),
-            pin_protocol_v2: PinProtocol::new(rng),
+            pin_protocol_v1: PinProtocol::new(env.rng()),
+            pin_protocol_v2: PinProtocol::new(env.rng()),
             consecutive_pin_mismatches: 0,
-            pin_uv_auth_token_state: PinUvAuthTokenState::new(),
+            pin_uv_auth_token_state: PinUvAuthTokenState::<E>::new(),
         }
     }
 
@@ -158,7 +158,7 @@ impl ClientPin {
     /// Also, in case of failure, the key agreement key is randomly reset.
     fn verify_pin_hash_enc(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
         pin_uv_auth_protocol: PinUvAuthProtocol,
         shared_secret: &dyn SharedSecret,
         pin_hash_enc: Vec<u8>,
@@ -196,7 +196,7 @@ impl ClientPin {
 
     fn process_get_pin_retries(
         &self,
-        env: &mut impl Env,
+        env: &mut E,
     ) -> Result<AuthenticatorClientPinResponse, Ctap2StatusCode> {
         Ok(AuthenticatorClientPinResponse {
             key_agreement: None,
@@ -224,7 +224,7 @@ impl ClientPin {
 
     fn process_set_pin(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
         client_pin_params: AuthenticatorClientPinParameters,
     ) -> Result<(), Ctap2StatusCode> {
         let AuthenticatorClientPinParameters {
@@ -251,7 +251,7 @@ impl ClientPin {
 
     fn process_change_pin(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
         client_pin_params: AuthenticatorClientPinParameters,
     ) -> Result<(), Ctap2StatusCode> {
         let AuthenticatorClientPinParameters {
@@ -289,7 +289,7 @@ impl ClientPin {
 
     fn process_get_pin_token(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
         client_pin_params: AuthenticatorClientPinParameters,
     ) -> Result<AuthenticatorClientPinResponse, Ctap2StatusCode> {
         let AuthenticatorClientPinParameters {
@@ -323,7 +323,7 @@ impl ClientPin {
         self.pin_protocol_v1.reset_pin_uv_auth_token(env.rng());
         self.pin_protocol_v2.reset_pin_uv_auth_token(env.rng());
         self.pin_uv_auth_token_state
-            .begin_using_pin_uv_auth_token();
+            .begin_using_pin_uv_auth_token(env);
         self.pin_uv_auth_token_state.set_default_permissions();
         let pin_uv_auth_token = shared_secret.encrypt(
             env.rng(),
@@ -356,7 +356,7 @@ impl ClientPin {
 
     fn process_get_pin_uv_auth_token_using_pin_with_permissions(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
         mut client_pin_params: AuthenticatorClientPinParameters,
     ) -> Result<AuthenticatorClientPinResponse, Ctap2StatusCode> {
         // Mutating client_pin_params is just an optimization to move it into
@@ -384,7 +384,7 @@ impl ClientPin {
     /// Processes the authenticatorClientPin command.
     pub fn process_command(
         &mut self,
-        env: &mut impl Env,
+        env: &mut E,
         client_pin_params: AuthenticatorClientPinParameters,
     ) -> Result<ResponseData, Ctap2StatusCode> {
         let response = match client_pin_params.sub_command {
@@ -437,11 +437,11 @@ impl ClientPin {
     }
 
     /// Resets all held state.
-    pub fn reset(&mut self, rng: &mut impl Rng256) {
-        self.pin_protocol_v1.regenerate(rng);
-        self.pin_protocol_v1.reset_pin_uv_auth_token(rng);
-        self.pin_protocol_v2.regenerate(rng);
-        self.pin_protocol_v2.reset_pin_uv_auth_token(rng);
+    pub fn reset(&mut self, env: &mut E) {
+        self.pin_protocol_v1.regenerate(env.rng());
+        self.pin_protocol_v1.reset_pin_uv_auth_token(env.rng());
+        self.pin_protocol_v2.regenerate(env.rng());
+        self.pin_protocol_v2.reset_pin_uv_auth_token(env.rng());
         self.consecutive_pin_mismatches = 0;
         self.pin_uv_auth_token_state.stop_using_pin_uv_auth_token();
     }
@@ -456,7 +456,7 @@ impl ClientPin {
     /// 32 byte.
     pub fn process_hmac_secret(
         &self,
-        rng: &mut impl Rng256,
+        env: &mut E,
         hmac_secret_input: GetAssertionHmacSecretInput,
         cred_random: &[u8; 32],
     ) -> Result<Vec<u8>, Ctap2StatusCode> {
@@ -480,7 +480,7 @@ impl ClientPin {
             let mut output2 = hmac_256::<Sha256>(cred_random, &decrypted_salts[32..]).to_vec();
             output.append(&mut output2);
         }
-        shared_secret.encrypt(rng, &output)
+        shared_secret.encrypt(env.rng(), &output)
     }
 
     /// Consumes flags and permissions related to the pinUvAuthToken.
@@ -491,9 +491,9 @@ impl ClientPin {
     }
 
     /// Updates the running timers, triggers timeout events.
-    pub fn update_timeouts(&mut self) {
+    pub fn update_timeouts(&mut self, env: &E) {
         self.pin_uv_auth_token_state
-            .pin_uv_auth_token_usage_timer_observer();
+            .pin_uv_auth_token_usage_timer_observer(env);
     }
 
     /// Checks if user verification is cached for use of the pinUvAuthToken.
@@ -553,19 +553,20 @@ impl ClientPin {
 
     #[cfg(test)]
     pub fn new_test(
+        env: &mut E,
         key_agreement_key: crypto::ecdh::SecKey,
         pin_uv_auth_token: [u8; PIN_TOKEN_LENGTH],
         pin_uv_auth_protocol: PinUvAuthProtocol,
-    ) -> ClientPin {
-        let mut env = crate::env::test::TestEnv::new();
+    ) -> Self {
         let (key_agreement_key_v1, key_agreement_key_v2) = match pin_uv_auth_protocol {
             PinUvAuthProtocol::V1 => (key_agreement_key, crypto::ecdh::SecKey::gensk(env.rng())),
             PinUvAuthProtocol::V2 => (crypto::ecdh::SecKey::gensk(env.rng()), key_agreement_key),
         };
-        let mut pin_uv_auth_token_state = PinUvAuthTokenState::new();
+        let mut pin_uv_auth_token_state = PinUvAuthTokenState::<E>::new();
         pin_uv_auth_token_state.set_permissions(0xFF);
-        pin_uv_auth_token_state.begin_using_pin_uv_auth_token(CtapInstant::new(0));
-        ClientPin {
+        let env = TestEnv::new();
+        pin_uv_auth_token_state.begin_using_pin_uv_auth_token(env);
+        Self {
             pin_protocol_v1: PinProtocol::new_test(key_agreement_key_v1, pin_uv_auth_token),
             pin_protocol_v2: PinProtocol::new_test(key_agreement_key_v2, pin_uv_auth_token),
             consecutive_pin_mismatches: 0,
@@ -578,9 +579,7 @@ impl ClientPin {
 mod test {
     use super::super::pin_protocol::authenticate_pin_uv_auth_token;
     use super::*;
-    use crate::env::test::TestEnv;
     use alloc::vec;
-    use embedded_time::duration::Milliseconds;
 
     /// Stores a PIN hash corresponding to the dummy PIN "1234".
     fn set_standard_pin(env: &mut TestEnv) {
@@ -608,14 +607,18 @@ mod test {
     /// should fail.
     fn create_client_pin_and_shared_secret(
         pin_uv_auth_protocol: PinUvAuthProtocol,
-    ) -> (ClientPin, Box<dyn SharedSecret>) {
+    ) -> (ClientPin<TestEnv>, Box<dyn SharedSecret>) {
         let mut env = TestEnv::new();
         let key_agreement_key = crypto::ecdh::SecKey::gensk(env.rng());
         let pk = key_agreement_key.genpk();
         let key_agreement = CoseKey::from(pk);
         let pin_uv_auth_token = [0x91; PIN_TOKEN_LENGTH];
-        let client_pin =
-            ClientPin::new_test(key_agreement_key, pin_uv_auth_token, pin_uv_auth_protocol);
+        let client_pin = ClientPin::<TestEnv>::new_test(
+            &mut env,
+            key_agreement_key,
+            pin_uv_auth_token,
+            pin_uv_auth_protocol,
+        );
         let shared_secret = client_pin
             .get_pin_protocol(pin_uv_auth_protocol)
             .decapsulate(key_agreement, pin_uv_auth_protocol)
@@ -629,7 +632,7 @@ mod test {
     fn create_client_pin_and_parameters(
         pin_uv_auth_protocol: PinUvAuthProtocol,
         sub_command: ClientPinSubCommand,
-    ) -> (ClientPin, AuthenticatorClientPinParameters) {
+    ) -> (ClientPin<TestEnv>, AuthenticatorClientPinParameters) {
         let mut env = TestEnv::new();
         let (client_pin, shared_secret) = create_client_pin_and_shared_secret(pin_uv_auth_protocol);
 
@@ -673,7 +676,7 @@ mod test {
     #[test]
     fn test_mix_pin_protocols() {
         let mut env = TestEnv::new();
-        let client_pin = ClientPin::new(env.rng());
+        let client_pin = ClientPin::<TestEnv>::new(&mut env);
         let pin_protocol_v1 = client_pin.get_pin_protocol(PinUvAuthProtocol::V1);
         let pin_protocol_v2 = client_pin.get_pin_protocol(PinUvAuthProtocol::V2);
         let message = vec![0xAA; 16];
@@ -714,7 +717,7 @@ mod test {
 
     fn test_helper_verify_pin_hash_enc(pin_uv_auth_protocol: PinUvAuthProtocol) {
         let mut env = TestEnv::new();
-        let mut client_pin = ClientPin::new(env.rng());
+        let mut client_pin = ClientPin::<TestEnv>::new(&mut env);
         let pin_protocol = client_pin.get_pin_protocol(pin_uv_auth_protocol);
         let shared_secret = pin_protocol
             .decapsulate(pin_protocol.get_public_key(), pin_uv_auth_protocol)
@@ -813,7 +816,7 @@ mod test {
             power_cycle_state: Some(false),
         });
         assert_eq!(
-            client_pin.process_command(&mut env, params.clone(), CtapInstant::new(0)),
+            client_pin.process_command(&mut env, params.clone()),
             Ok(ResponseData::AuthenticatorClientPin(expected_response))
         );
 
@@ -825,7 +828,7 @@ mod test {
             power_cycle_state: Some(true),
         });
         assert_eq!(
-            client_pin.process_command(&mut env, params, CtapInstant::new(0)),
+            client_pin.process_command(&mut env, params),
             Ok(ResponseData::AuthenticatorClientPin(expected_response))
         );
     }
@@ -853,7 +856,7 @@ mod test {
             power_cycle_state: None,
         });
         assert_eq!(
-            client_pin.process_command(&mut env, params, CtapInstant::new(0)),
+            client_pin.process_command(&mut env, params),
             Ok(ResponseData::AuthenticatorClientPin(expected_response))
         );
     }
@@ -873,7 +876,7 @@ mod test {
             create_client_pin_and_parameters(pin_uv_auth_protocol, ClientPinSubCommand::SetPin);
         let mut env = TestEnv::new();
         assert_eq!(
-            client_pin.process_command(&mut env, params, CtapInstant::new(0)),
+            client_pin.process_command(&mut env, params),
             Ok(ResponseData::AuthenticatorClientPin(None))
         );
     }
@@ -906,14 +909,14 @@ mod test {
         let pin_uv_auth_param = shared_secret.authenticate(&auth_param_data);
         params.pin_uv_auth_param = Some(pin_uv_auth_param);
         assert_eq!(
-            client_pin.process_command(&mut env, params.clone(), CtapInstant::new(0)),
+            client_pin.process_command(&mut env, params.clone()),
             Ok(ResponseData::AuthenticatorClientPin(None))
         );
 
         let mut bad_params = params.clone();
         bad_params.pin_hash_enc = Some(vec![0xEE; 16]);
         assert_eq!(
-            client_pin.process_command(&mut env, bad_params, CtapInstant::new(0)),
+            client_pin.process_command(&mut env, bad_params),
             Err(Ctap2StatusCode::CTAP2_ERR_PIN_AUTH_INVALID)
         );
 
@@ -921,7 +924,7 @@ mod test {
             storage::decr_pin_retries(&mut env).unwrap();
         }
         assert_eq!(
-            client_pin.process_command(&mut env, params, CtapInstant::new(0)),
+            client_pin.process_command(&mut env, params),
             Err(Ctap2StatusCode::CTAP2_ERR_PIN_BLOCKED)
         );
     }
@@ -952,7 +955,7 @@ mod test {
         set_standard_pin(&mut env);
 
         let response = client_pin
-            .process_command(&mut env, params.clone(), CtapInstant::new(0))
+            .process_command(&mut env, params.clone())
             .unwrap();
         let encrypted_token = match response {
             ResponseData::AuthenticatorClientPin(Some(response)) => {
@@ -988,7 +991,7 @@ mod test {
         let mut bad_params = params;
         bad_params.pin_hash_enc = Some(vec![0xEE; 16]);
         assert_eq!(
-            client_pin.process_command(&mut env, bad_params, CtapInstant::new(0)),
+            client_pin.process_command(&mut env, bad_params),
             Err(Ctap2StatusCode::CTAP2_ERR_PIN_INVALID)
         );
     }
@@ -1013,7 +1016,7 @@ mod test {
 
         assert_eq!(storage::force_pin_change(&mut env), Ok(()));
         assert_eq!(
-            client_pin.process_command(&mut env, params, CtapInstant::new(0)),
+            client_pin.process_command(&mut env, params),
             Err(Ctap2StatusCode::CTAP2_ERR_PIN_INVALID),
         );
     }
@@ -1046,7 +1049,7 @@ mod test {
         set_standard_pin(&mut env);
 
         let response = client_pin
-            .process_command(&mut env, params.clone(), CtapInstant::new(0))
+            .process_command(&mut env, params.clone())
             .unwrap();
         let encrypted_token = match response {
             ResponseData::AuthenticatorClientPin(Some(response)) => {
@@ -1082,21 +1085,21 @@ mod test {
         let mut bad_params = params.clone();
         bad_params.permissions = Some(0x00);
         assert_eq!(
-            client_pin.process_command(&mut env, bad_params, CtapInstant::new(0)),
+            client_pin.process_command(&mut env, bad_params),
             Err(Ctap2StatusCode::CTAP1_ERR_INVALID_PARAMETER)
         );
 
         let mut bad_params = params.clone();
         bad_params.permissions_rp_id = None;
         assert_eq!(
-            client_pin.process_command(&mut env, bad_params, CtapInstant::new(0)),
+            client_pin.process_command(&mut env, bad_params),
             Err(Ctap2StatusCode::CTAP1_ERR_INVALID_PARAMETER)
         );
 
         let mut bad_params = params;
         bad_params.pin_hash_enc = Some(vec![0xEE; 16]);
         assert_eq!(
-            client_pin.process_command(&mut env, bad_params, CtapInstant::new(0)),
+            client_pin.process_command(&mut env, bad_params),
             Err(Ctap2StatusCode::CTAP2_ERR_PIN_INVALID)
         );
     }
@@ -1123,7 +1126,7 @@ mod test {
 
         assert_eq!(storage::force_pin_change(&mut env), Ok(()));
         assert_eq!(
-            client_pin.process_command(&mut env, params, CtapInstant::new(0)),
+            client_pin.process_command(&mut env, params),
             Err(Ctap2StatusCode::CTAP2_ERR_PIN_INVALID)
         );
     }
@@ -1257,7 +1260,7 @@ mod test {
             salt_auth,
             pin_uv_auth_protocol,
         };
-        let output = client_pin.process_hmac_secret(env.rng(), hmac_secret_input, cred_random);
+        let output = client_pin.process_hmac_secret(&mut env, hmac_secret_input, cred_random);
         output.map(|v| shared_secret.as_ref().decrypt(&v).unwrap())
     }
 
@@ -1277,7 +1280,7 @@ mod test {
             salt_auth,
             pin_uv_auth_protocol,
         };
-        let output = client_pin.process_hmac_secret(env.rng(), hmac_secret_input, &cred_random);
+        let output = client_pin.process_hmac_secret(&mut env, hmac_secret_input, &cred_random);
         assert_eq!(output, Err(Ctap2StatusCode::CTAP2_ERR_PIN_AUTH_INVALID));
     }
 
@@ -1379,7 +1382,7 @@ mod test {
     #[test]
     fn test_has_permission() {
         let mut env = TestEnv::new();
-        let mut client_pin = ClientPin::new(env.rng());
+        let mut client_pin = ClientPin::<TestEnv>::new(&mut env);
         client_pin.pin_uv_auth_token_state.set_permissions(0x7F);
         for permission in PinPermission::into_enum_iter() {
             assert_eq!(
@@ -1403,7 +1406,7 @@ mod test {
     #[test]
     fn test_has_no_rp_id_permission() {
         let mut env = TestEnv::new();
-        let mut client_pin = ClientPin::new(env.rng());
+        let mut client_pin = ClientPin::<TestEnv>::new(&mut env);
         assert_eq!(client_pin.has_no_rp_id_permission(), Ok(()));
         client_pin
             .pin_uv_auth_token_state
@@ -1417,7 +1420,7 @@ mod test {
     #[test]
     fn test_has_no_or_rp_id_permission() {
         let mut env = TestEnv::new();
-        let mut client_pin = ClientPin::new(env.rng());
+        let mut client_pin = ClientPin::<TestEnv>::new(&mut env);
         assert_eq!(client_pin.has_no_or_rp_id_permission("example.com"), Ok(()));
         client_pin
             .pin_uv_auth_token_state
@@ -1432,7 +1435,7 @@ mod test {
     #[test]
     fn test_has_no_or_rp_id_hash_permission() {
         let mut env = TestEnv::new();
-        let mut client_pin = ClientPin::new(env.rng());
+        let mut client_pin = ClientPin::<TestEnv>::new(&mut env);
         let rp_id_hash = Sha256::hash(b"example.com");
         assert_eq!(
             client_pin.has_no_or_rp_id_hash_permission(&rp_id_hash),
@@ -1454,7 +1457,7 @@ mod test {
     #[test]
     fn test_ensure_rp_id_permission() {
         let mut env = TestEnv::new();
-        let mut client_pin = ClientPin::new(env.rng());
+        let mut client_pin = ClientPin::<TestEnv>::new(&mut env);
         assert_eq!(client_pin.ensure_rp_id_permission("example.com"), Ok(()));
         assert_eq!(
             client_pin
@@ -1472,11 +1475,11 @@ mod test {
     #[test]
     fn test_verify_pin_uv_auth_token() {
         let mut env = TestEnv::new();
-        let mut client_pin = ClientPin::new(env.rng());
+        let mut client_pin = ClientPin::<TestEnv>::new(&mut env);
         let message = [0xAA];
         client_pin
             .pin_uv_auth_token_state
-            .begin_using_pin_uv_auth_token(CtapInstant::new(0));
+            .begin_using_pin_uv_auth_token(&env);
 
         let pin_uv_auth_token_v1 = client_pin
             .get_pin_protocol(PinUvAuthProtocol::V1)
@@ -1546,7 +1549,7 @@ mod test {
     #[test]
     fn test_verify_pin_uv_auth_token_not_in_use() {
         let mut env = TestEnv::new();
-        let client_pin = ClientPin::new(env.rng());
+        let client_pin = ClientPin::<TestEnv>::new(&mut env);
         let message = [0xAA];
 
         let pin_uv_auth_token_v1 = client_pin
@@ -1568,7 +1571,7 @@ mod test {
     #[test]
     fn test_reset() {
         let mut env = TestEnv::new();
-        let mut client_pin = ClientPin::new(env.rng());
+        let mut client_pin = ClientPin::<TestEnv>::new(&mut env);
         let public_key_v1 = client_pin.pin_protocol_v1.get_public_key();
         let public_key_v2 = client_pin.pin_protocol_v2.get_public_key();
         let token_v1 = *client_pin.pin_protocol_v1.get_pin_uv_auth_token();
@@ -1577,7 +1580,7 @@ mod test {
         client_pin
             .pin_uv_auth_token_state
             .set_permissions_rp_id(Some(String::from("example.com")));
-        client_pin.reset(env.rng());
+        client_pin.reset(&mut env);
         assert_ne!(public_key_v1, client_pin.pin_protocol_v1.get_public_key());
         assert_ne!(public_key_v2, client_pin.pin_protocol_v2.get_public_key());
         assert_ne!(
@@ -1608,7 +1611,7 @@ mod test {
         params.permissions = Some(0xFF);
 
         assert!(client_pin
-            .process_command(&mut env, params, CtapInstant::new(0))
+            .process_command(&mut env, params)
             .is_ok());
         for permission in PinPermission::into_enum_iter() {
             assert_eq!(
@@ -1625,8 +1628,8 @@ mod test {
             Ok(())
         );
 
-        let timeout = CtapInstant::new(0) + Milliseconds::new(30001_u32);
-        client_pin.update_timeouts(timeout);
+        env.clock().advance(30001_u32);
+        client_pin.update_timeouts(env);
         for permission in PinPermission::into_enum_iter() {
             assert_eq!(
                 client_pin
@@ -1654,7 +1657,7 @@ mod test {
         params.permissions = Some(0xFF);
 
         assert!(client_pin
-            .process_command(&mut env, params, CtapInstant::new(0))
+            .process_command(&mut env, params)
             .is_ok());
         for permission in PinPermission::into_enum_iter() {
             assert_eq!(

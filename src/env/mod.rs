@@ -19,12 +19,7 @@ use crate::api::firmware_protection::FirmwareProtection;
 use crate::api::key_store::KeyStore;
 use crate::api::upgrade_storage::UpgradeStorage;
 use crate::api::user_presence::UserPresence;
-use crate::api::{firmware_protection::FirmwareProtection, self};
-use crate::api::upgrade_storage::UpgradeStorage;
 use crate::api::clock::Clock;
-use crate::ctap::status_code::Ctap2StatusCode;
-use crate::ctap::Channel;
-use crypto::rng256::Rng256;
 use persistent_store::{Storage, Store};
 use rng256::Rng256;
 
@@ -51,7 +46,7 @@ pub trait Env {
     fn store(&mut self) -> &mut Store<Self::Storage>;
     fn key_store(&mut self) -> &mut Self::KeyStore;
     fn attestation_store(&mut self) -> &mut Self::AttestationStore;
-    fn clock(&mut self) -> &mut Self::Clock;
+    fn clock(&self) -> &Self::Clock;
 
     /// Returns the upgrade storage instance.
     ///

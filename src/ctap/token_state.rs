@@ -19,7 +19,6 @@ use crate::env::Env;
 use alloc::string::String;
 use crypto::sha256::Sha256;
 use crypto::Hash256;
-use embedded_time::duration::Milliseconds;
 
 /// Timeout for auth tokens.
 ///
@@ -34,18 +33,18 @@ const INITIAL_USAGE_TIME_LIMIT:u32 = 30000_u32;
 /// built-in user verification. Therefore, we never cache user presence.
 ///
 /// This implementation does not use a rolling timer.
-pub struct PinUvAuthTokenState<E:Env> {
+pub struct PinUvAuthTokenState<E: Env> {
     // Relies on the fact that all permissions are represented by powers of two.
     permissions_set: u8,
     permissions_rp_id: Option<String>,
-    usage_timer: Option<E::Clock::Timer>,
+    usage_timer: Option<<<E as Env>::Clock as Clock>::Timer>,
     user_verified: bool,
     in_use: bool,
 }
 
-impl<E:Env> PinUvAuthTokenState<E> {
+impl<E: Env> PinUvAuthTokenState<E> {
     /// Creates a pinUvAuthToken state without permissions.
-    pub fn new() -> PinUvAuthTokenState<E> {
+    pub fn new() -> Self {
         PinUvAuthTokenState {
             permissions_set: 0,
             permissions_rp_id: None,
@@ -112,14 +111,14 @@ impl<E:Env> PinUvAuthTokenState<E> {
     }
 
     /// Starts the timer for pinUvAuthToken usage.
-    pub fn begin_using_pin_uv_auth_token(&mut self, env: &mut impl Env) {
+    pub fn begin_using_pin_uv_auth_token(&mut self, env: &E) {
         self.user_verified = true;
         self.usage_timer = Some(env.clock().make_timer(INITIAL_USAGE_TIME_LIMIT));
         self.in_use = true;
     }
 
     /// Updates the usage timer, and disables the pinUvAuthToken on timeout.
-    pub fn pin_uv_auth_token_usage_timer_observer(&mut self, env: &mut impl Env) {
+    pub fn pin_uv_auth_token_usage_timer_observer(&mut self, env: &E) {
         if !self.in_use {
             return;
         }
@@ -157,12 +156,28 @@ impl<E:Env> PinUvAuthTokenState<E> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::env::test::TestEnv;
     use enum_iterator::IntoEnumIterator;
 
     #[test]
+    fn test_observer() {
+        let mut token_state = PinUvAuthTokenState::<TestEnv>::new();
+        let env = TestEnv::new();
+        token_state.begin_using_pin_uv_auth_token(&env);
+        assert!(token_state.is_in_use());
+        env.clock().advance(100_u32);
+        token_state.pin_uv_auth_token_usage_timer_observer(&env);
+        assert!(token_state.is_in_use());
+        env.clock().advance(INITIAL_USAGE_TIME_LIMIT);
+        token_state.pin_uv_auth_token_usage_timer_observer(&env);
+        assert!(!token_state.is_in_use());
+    }
+
+    #[test]
     fn test_stop() {
-        let mut token_state = PinUvAuthTokenState::new();
-        token_state.begin_using_pin_uv_auth_token();
+        let mut token_state = PinUvAuthTokenState::<TestEnv>::new();
+        let env = TestEnv::new();
+        token_state.begin_using_pin_uv_auth_token(&env);
         assert!(token_state.is_in_use());
         token_state.stop_using_pin_uv_auth_token();
         assert!(!token_state.is_in_use());
@@ -170,7 +185,7 @@ mod test {
 
     #[test]
     fn test_permissions() {
-        let mut token_state = PinUvAuthTokenState::new();
+        let mut token_state = PinUvAuthTokenState::<TestEnv>::new();
         token_state.set_permissions(0xFF);
         for permission in PinPermission::into_enum_iter() {
             assert_eq!(token_state.has_permission(permission), Ok(()));
@@ -195,7 +210,7 @@ mod test {
 
     #[test]
     fn test_permissions_rp_id_none() {
-        let mut token_state = PinUvAuthTokenState::new();
+        let mut token_state = PinUvAuthTokenState::<TestEnv>::new();
         let example_hash = Sha256::hash(b"example.com");
         token_state.set_permissions_rp_id(None);
         assert_eq!(token_state.has_no_permissions_rp_id(), Ok(()));
@@ -211,7 +226,7 @@ mod test {
 
     #[test]
     fn test_permissions_rp_id_some() {
-        let mut token_state = PinUvAuthTokenState::new();
+        let mut token_state = PinUvAuthTokenState::<TestEnv>::new();
         let example_hash = Sha256::hash(b"example.com");
         token_state.set_permissions_rp_id(Some(String::from("example.com")));
 
@@ -246,13 +261,14 @@ mod test {
 
     #[test]
     fn test_user_verified_flag() {
-        let mut token_state = PinUvAuthTokenState::new();
+        let mut token_state = PinUvAuthTokenState::<TestEnv>::new();
+        let env = TestEnv::new();
         assert!(!token_state.get_user_verified_flag_value());
-        token_state.begin_using_pin_uv_auth_token();
+        token_state.begin_using_pin_uv_auth_token(&env);
         assert!(token_state.get_user_verified_flag_value());
         token_state.clear_user_verified_flag();
         assert!(!token_state.get_user_verified_flag_value());
-        token_state.begin_using_pin_uv_auth_token();
+        token_state.begin_using_pin_uv_auth_token(&env);
         assert!(token_state.get_user_verified_flag_value());
         token_state.stop_using_pin_uv_auth_token();
         assert!(!token_state.get_user_verified_flag_value());
