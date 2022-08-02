@@ -198,7 +198,7 @@ impl<E: Env> CtapHid<E> {
     pub const CAPABILITY_NMSG: u8 = 0x08;
 
     // TODO: Is this timeout duration specified?
-    const TIMEOUT_DURATION: Milliseconds<ClockInt> = Milliseconds(100 as ClockInt);
+    const TIMEOUT_DURATION: u32 = 100;
 
     /// Creates a new CTAP HID packet parser.
     ///

@@ -32,6 +32,8 @@ use crypto::Hash256;
 #[cfg(test)]
 use enum_iterator::IntoEnumIterator;
 use subtle::ConstantTimeEq;
+#[cfg(test)]
+use crate::env::test::TestEnv;
 
 /// The prefix length of the PIN hash that is stored and compared.
 ///
@@ -577,9 +579,7 @@ impl<E: Env> ClientPin<E> {
 mod test {
     use super::super::pin_protocol::authenticate_pin_uv_auth_token;
     use super::*;
-    use crate::env::test::TestEnv;
     use alloc::vec;
-    use embedded_time::duration::Milliseconds;
 
     /// Stores a PIN hash corresponding to the dummy PIN "1234".
     fn set_standard_pin(env: &mut TestEnv) {

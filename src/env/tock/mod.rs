@@ -31,7 +31,6 @@ use libtock_core::syscalls;
 use libtock_drivers::buttons::{self, ButtonState};
 use libtock_drivers::console::Console;
 use libtock_drivers::result::{FlexUnwrap, TockError};
-use libtock_drivers::timer::Duration;
 use libtock_drivers::usb_ctap_hid::{self, UsbEndpoint};
 use libtock_drivers::{crp, led, timer};
 use persistent_store::{StorageResult, Store};
@@ -235,6 +234,7 @@ impl Env for TockEnv {
     type Write = Console;
     type Customization = CustomizationImpl;
     type HidConnection = TockHidConnection;
+    type Clock = TockClock;
 
     fn rng(&mut self) -> &mut Self::Rng {
         &mut self.rng
@@ -266,6 +266,10 @@ impl Env for TockEnv {
 
     fn write(&mut self) -> Self::Write {
         Console::new()
+    }
+
+    fn customization(&self) -> &Self::Customization {
+        &DEFAULT_CUSTOMIZATION
     }
 
     fn clock(&self) -> &Self::Clock {

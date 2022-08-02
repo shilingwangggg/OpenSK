@@ -15,13 +15,10 @@
 use crate::ctap::client_pin::PinPermission;
 use crate::ctap::status_code::Ctap2StatusCode;
 use crate::api::clock::Clock;
-use crate::ctap::timed_permission::TimedPermission;
 use crate::env::Env;
 use alloc::string::String;
-use core::marker::PhantomData;
 use crypto::sha256::Sha256;
 use crypto::Hash256;
-use embedded_time::duration::Milliseconds;
 
 /// Timeout for auth tokens.
 ///
